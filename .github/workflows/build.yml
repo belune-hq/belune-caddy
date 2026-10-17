@@ -159,8 +159,11 @@ jobs:
           build-args: |
             CADDY_VERSION=${{ needs.resolve.outputs.caddy_version }}
             BELUNE_CADDY_REVISION=${{ needs.resolve.outputs.revision }}
+          # ⚠️ No `load:` here. The docker exporter cannot load a multi-platform
+          # build, so loading and `platforms:` are mutually exclusive — the
+          # single-arch image the next step needs is built there instead, off
+          # this step's cache.
           push: ${{ github.event_name != 'pull_request' }}
-          load: ${{ github.event_name == 'pull_request' }}
           tags: ${{ steps.meta.outputs.image_ref }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -185,6 +188,11 @@ jobs:
   test:
     name: Belune integration suites
     needs: [resolve, build]
+    # A pull request does not publish, so there is no image for this job to
+    # pull — jobs run on separate runners and the build never left its own.
+    # A PR therefore gets the build and the module check; the suites run on
+    # the paths that actually produce a published image.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       # The gate lives in the Belune repo. Pinned to the latest STABLE tag, not
