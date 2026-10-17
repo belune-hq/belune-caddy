@@ -234,7 +234,19 @@ jobs:
     # the paths that actually produce a published image.
     if: needs.resolve.outputs.should_build == 'true' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
+      # Each job gets a fresh runner, so the build job's login does not carry
+      # over — and a newly published GHCR package is private, so pulling the
+      # image under test needs credentials even inside the same org.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       # The gate lives in the Belune repo. Pinned to the latest STABLE tag, not
       # main: installs run released Belune, so that is what this image has to
       # work with. Testing against unreleased main would gate on code nobody
@@ -287,7 +299,7 @@ jobs:
 
       - name: Caddy logs on failure
         if: failure()
-        run: docker logs caddy
+        run: docker logs caddy || echo "(no container — it never started)"
 
   promote:
     name: Promote the floating tag
