@@ -22,9 +22,12 @@ on:
         required: false
         type: string
       revision:
-        description: "Module-list revision for this Caddy version"
+        # ⛔ No default. A default makes "not specified" indistinguishable from
+        # "explicitly 1", and the resolve step reads a non-empty value as an
+        # override — which pinned every dispatched run to revision 1 and
+        # republished an already-published tag.
+        description: "Module-list revision (blank = decide automatically)"
         required: false
-        default: "1"
         type: string
       belune_ref:
         description: "Belune ref to gate against (blank = latest stable tag)"
@@ -129,6 +132,16 @@ jobs:
             REVISION=$((STATE_REVISION + 1))
           else
             SHOULD_BUILD="false"                     # the daily no-op
+          fi
+          # The registry is the authority on what has already shipped — the
+          # state file can drift, and a published tag must never be rewritten.
+          # Walk the revision up until it names a tag that does not exist yet.
+          if [ "$SHOULD_BUILD" = "true" ]; then
+            while docker buildx imagetools inspect \
+                    "${IMAGE}:${TARGET}-${REVISION}" >/dev/null 2>&1; do
+              echo "${IMAGE}:${TARGET}-${REVISION} already exists — not overwriting"
+              REVISION=$((REVISION + 1))
+            done
           fi
           echo "should build:        $SHOULD_BUILD (revision $REVISION)"
 
