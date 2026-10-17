@@ -26,6 +26,10 @@ on:
         required: false
         default: "1"
         type: string
+      belune_ref:
+        description: "Belune ref to gate against (blank = latest stable tag)"
+        required: false
+        type: string
       promote:
         description: "Move the floating :2 tag if the suites pass"
         required: false
@@ -251,15 +255,31 @@ jobs:
       # main: installs run released Belune, so that is what this image has to
       # work with. Testing against unreleased main would gate on code nobody
       # is running yet.
-      - name: Check out Belune at its latest stable tag
+      # Default: the latest STABLE tag, because installs run released Belune
+      # and that is what this image has to work with.
+      #
+      # ⚠️ The cost of that default: a fix to these suites does not reach the
+      # gate until Belune's next release, so the bot stays red in between. The
+      # BELUNE_GATE_REF repository variable is the escape hatch — set it to
+      # `main` while a Belune release is in development, and unset it when the
+      # release ships. The dispatch input overrides both for a one-off run.
+      - name: Check out Belune
+        env:
+          INPUT_REF: ${{ inputs.belune_ref }}
+          VAR_REF: ${{ vars.BELUNE_GATE_REF }}
         run: |
           set -euo pipefail
           git clone --quiet --filter=blob:none "https://github.com/${BELUNE_REPO}.git" belune
           cd belune
-          TAG=$(git tag -l 'v[0-9]*' --sort=-v:refname | grep -v -- '-' | head -1)
-          echo "gating against Belune $TAG"
-          git checkout --quiet "$TAG"
-          echo "BELUNE_TAG=$TAG" >> "$GITHUB_ENV"
+          REF="${INPUT_REF:-${VAR_REF:-}}"
+          if [ -z "$REF" ]; then
+            REF=$(git tag -l 'v[0-9]*' --sort=-v:refname | grep -v -- '-' | head -1)
+            echo "gating against the latest stable tag: $REF"
+          else
+            echo "::warning::gating against '$REF', not the latest stable tag"
+          fi
+          git checkout --quiet "$REF"
+          echo "BELUNE_TAG=$REF" >> "$GITHUB_ENV"
 
       - uses: actions/setup-go@v5
         with:
