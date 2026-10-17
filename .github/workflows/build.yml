@@ -1,0 +1,296 @@
+name: Build
+
+# The rebuild bot. Two trigger axes, because this image has no release cadence
+# of its own to ride:
+#
+#   1. Upstream Caddy releases.
+#   2. The Go toolchain — for a Go HTTP server the recurring CVE source is the
+#      standard library (HTTP/2, TLS, header parsing), fixed by rebuilding on a
+#      patched toolchain. The daily schedule covers this: it rebuilds whenever
+#      the digest of the upstream builder image has moved, even when the Caddy
+#      version has not.
+#
+# ⚠️ Building this image moved Caddy's security responsibility from upstream to
+# us. If this workflow stalls, installs stop receiving Caddy fixes and nothing
+# says so out loud. Treat a red run here as a security issue, not a chore.
+
+on:
+  workflow_dispatch:
+    inputs:
+      caddy_version:
+        description: "Upstream Caddy version (blank = latest release)"
+        required: false
+        type: string
+      revision:
+        description: "Module-list revision for this Caddy version"
+        required: false
+        default: "1"
+        type: string
+      promote:
+        description: "Move the floating :2 tag if the suites pass"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # Daily. Cheap when nothing moved: resolve exits early.
+    - cron: "17 6 * * *"
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/belune-hq/belune-caddy
+  # The repository holding the integration suites that gate promotion. Public,
+  # so no token is needed to check it out.
+  BELUNE_REPO: weiliang79/belune
+
+jobs:
+  resolve:
+    name: Resolve target version
+    runs-on: ubuntu-latest
+    outputs:
+      caddy_version: ${{ steps.pick.outputs.caddy_version }}
+      revision: ${{ steps.pick.outputs.revision }}
+      bump: ${{ steps.pick.outputs.bump }}
+      should_build: ${{ steps.pick.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.caddy_version }}
+          INPUT_REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+
+          # The Dockerfile's default is the version this repo currently claims.
+          CURRENT=$(sed -n 's/^ARG CADDY_VERSION=//p' Dockerfile | head -1)
+          echo "repo currently pins: $CURRENT"
+
+          if [ -n "${INPUT_VERSION}" ]; then
+            TARGET="${INPUT_VERSION}"
+          else
+            TARGET=$(gh api repos/caddyserver/caddy/releases/latest --jq .tag_name | sed 's/^v//')
+          fi
+          echo "upstream latest:     $TARGET"
+
+          # Both values flow into later `${{ }}` interpolations inside shell
+          # commands, so they are validated HERE, once, rather than quoted
+          # carefully in five places. Anything that is not a plain version is
+          # refused outright.
+          case "$TARGET" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::refusing a version that is not N.N.N: $TARGET"; exit 1 ;;
+          esac
+          case "${INPUT_REVISION:-1}" in
+            ''|*[!0-9]*) echo "::error::revision must be digits"; exit 1 ;;
+          esac
+
+          # patch vs minor decides whether promotion may be automatic.
+          cur_mm="${CURRENT%.*}"; tgt_mm="${TARGET%.*}"
+          if [ "$CURRENT" = "$TARGET" ]; then
+            BUMP=none
+          elif [ "$cur_mm" = "$tgt_mm" ]; then
+            BUMP=patch
+          else
+            BUMP=minor
+          fi
+
+          # A scheduled run with no version change still rebuilds, to pick up a
+          # patched Go toolchain in the upstream builder image. That is the
+          # whole point of the second trigger axis.
+          SHOULD_BUILD=true
+
+          echo "caddy_version=$TARGET"      >> "$GITHUB_OUTPUT"
+          echo "revision=${INPUT_REVISION:-1}" >> "$GITHUB_OUTPUT"
+          echo "bump=$BUMP"                 >> "$GITHUB_OUTPUT"
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Resolved"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| repo pins | \`$CURRENT\` |"
+            echo "| target | \`$TARGET\` |"
+            echo "| bump | \`$BUMP\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build image
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_ref: ${{ steps.meta.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+
+      - id: meta
+        run: |
+          REF="${IMAGE}:${{ needs.resolve.outputs.caddy_version }}-${{ needs.resolve.outputs.revision }}"
+          echo "image_ref=$REF" >> "$GITHUB_OUTPUT"
+
+      # Push only on main/dispatch. A pull request builds and tests without
+      # publishing anything.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ⛔ The versioned tag is NOT the floating :2 tag. :2 moves only in the
+      # promote job, after the suites pass — that separation is the gate.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            CADDY_VERSION=${{ needs.resolve.outputs.caddy_version }}
+            BELUNE_CADDY_REVISION=${{ needs.resolve.outputs.revision }}
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: ${{ steps.meta.outputs.image_ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The modules must actually be in the binary
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64 --load \
+            --build-arg CADDY_VERSION=${{ needs.resolve.outputs.caddy_version }} \
+            -t belune-caddy:verify . >/dev/null
+          MODS=$(docker run --rm --entrypoint caddy belune-caddy:verify list-modules)
+          echo "$MODS" | sed -n '1,5p'
+          # One representative module per capability Belune probes for. A build
+          # that silently dropped one would otherwise publish and only surface
+          # later as a feature reporting "not configured" on every install.
+          for m in http.handlers.rate_limit dns.providers.cloudflare dns.providers.route53 \
+                   dns.providers.digitalocean http.handlers.waf http.handlers.crowdsec layer4; do
+            echo "$MODS" | grep -qx "$m" || { echo "::error::module missing from the build: $m"; exit 1; }
+          done
+          echo "all probed modules present"
+
+  test:
+    name: Belune integration suites
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      # The gate lives in the Belune repo. Pinned to the latest STABLE tag, not
+      # main: installs run released Belune, so that is what this image has to
+      # work with. Testing against unreleased main would gate on code nobody
+      # is running yet.
+      - name: Check out Belune at its latest stable tag
+        run: |
+          set -euo pipefail
+          git clone --quiet --filter=blob:none https://github.com/${BELUNE_REPO}.git belune
+          cd belune
+          TAG=$(git tag -l 'v[0-9]*' --sort=-v:refname | grep -v -- '-' | head -1)
+          echo "gating against Belune $TAG"
+          git checkout --quiet "$TAG"
+          echo "BELUNE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: belune/apps/api/go.mod
+          cache-dependency-path: belune/apps/api/go.sum
+
+      # The suites do NOT start Caddy — they drive an existing admin API at
+      # CADDY_ADMIN_URL. So stand the built image up the way Belune runs it,
+      # with Belune's own Caddyfile, or the test proves nothing about this image.
+      - name: Start the built Caddy
+        run: |
+          set -euo pipefail
+          docker run -d --name caddy \
+            -p 127.0.0.1:2019:2019 -p 80:80 -p 443:443 \
+            -e BELUNE_CADDY_GLOBAL_OPTIONS=local_certs \
+            -e BELUNE_DASHBOARD_UPSTREAM=host.docker.internal:8080 \
+            -v "$PWD/belune/infra/caddy/Caddyfile.template:/etc/caddy/Caddyfile" \
+            -v "$PWD/belune/infra/caddy/sites:/etc/caddy/sites" \
+            ${{ needs.build.outputs.image_ref }}
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:2019/config/ >/dev/null 2>&1 && break
+            sleep 2
+          done
+          curl -fsS http://localhost:2019/config/ >/dev/null \
+            || { echo "::error::admin API never came up"; docker logs caddy; exit 1; }
+
+      # -p 1: these drive one shared Caddy and will fight over its config if
+      # the packages run in parallel.
+      - name: Run the suites
+        working-directory: belune/apps/api
+        env:
+          BELUNE_CADDY_INTEGRATION: "1"
+          CADDY_ADMIN_URL: http://localhost:2019
+        run: |
+          go test -count=1 -p 1 -timeout=30m \
+            ./internal/proxy/caddy/ ./internal/proxy/ ./internal/worker/
+
+      - name: Caddy logs on failure
+        if: failure()
+        run: docker logs caddy
+
+  promote:
+    name: Promote the floating tag
+    needs: [resolve, build, test]
+    if: >-
+      github.event_name != 'pull_request' &&
+      (needs.resolve.outputs.bump == 'patch' || needs.resolve.outputs.bump == 'none' ||
+       (github.event_name == 'workflow_dispatch' && inputs.promote))
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Move :2
+        run: |
+          docker buildx imagetools create \
+            -t ${IMAGE}:2 ${{ needs.build.outputs.image_ref }}
+          echo "moved ${IMAGE}:2 -> ${{ needs.build.outputs.image_ref }}" >> "$GITHUB_STEP_SUMMARY"
+
+  hold:
+    name: Minor bump held for review
+    needs: [resolve, build, test]
+    if: >-
+      github.event_name == 'schedule' && needs.resolve.outputs.bump == 'minor'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      # ⚠️ A minor Caddy release is NOT auto-promoted even when the suites are
+      # green. Belune's proxy depends on specific admin-API behaviour, and a
+      # change there breaks routing on every install at once — with the silent
+      # symptom, where every domain 502s on a stack that looks healthy.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.resolve.outputs.caddy_version }}
+          R: ${{ needs.resolve.outputs.revision }}
+        run: |
+          gh issue create --repo ${{ github.repository }} \
+            --title "Caddy $V is a minor bump — review before promoting" \
+            --body "$(printf '%s\n' \
+              "\`${IMAGE}:$V-$R\` is built and the Belune suites pass against it." \
+              "" \
+              "The floating \`:2\` tag has **not** moved, because this is a minor upstream bump." \
+              "Belune's proxy depends on specific admin-API behaviour (route-id traversal," \
+              "matcher pairing, strip-after-features ordering, deterministic reconciler output," \
+              "and the skip-list invariant). A change to any of it breaks routing on every" \
+              "install at once, and the symptom is silent: every domain 502s on a stack that" \
+              "looks healthy." \
+              "" \
+              "Promote with the \`Build\` workflow, \`promote: true\`, once reviewed.")"
