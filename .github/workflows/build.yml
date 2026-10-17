@@ -78,10 +78,12 @@ jobs:
           fi
           echo "upstream latest:     $TARGET"
 
-          # Both values flow into later `${{ }}` interpolations inside shell
-          # commands, so they are validated HERE, once, rather than quoted
-          # carefully in five places. Anything that is not a plain version is
-          # refused outright.
+          # Both values are interpolated into later shell commands by the
+          # workflow engine, so they are validated HERE, once, rather than
+          # quoted carefully in five places. Anything that is not a plain
+          # version is refused outright.
+          # (Careful: writing a literal GitHub expression in this comment would
+          # be PARSED as one — a run: block is expression-interpolated first.)
           case "$TARGET" in
             [0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "::error::refusing a version that is not N.N.N: $TARGET"; exit 1 ;;
@@ -93,22 +95,24 @@ jobs:
           # patch vs minor decides whether promotion may be automatic.
           cur_mm="${CURRENT%.*}"; tgt_mm="${TARGET%.*}"
           if [ "$CURRENT" = "$TARGET" ]; then
-            BUMP=none
+            BUMP="none"
           elif [ "$cur_mm" = "$tgt_mm" ]; then
-            BUMP=patch
+            BUMP="patch"
           else
-            BUMP=minor
+            BUMP="minor"
           fi
 
           # A scheduled run with no version change still rebuilds, to pick up a
           # patched Go toolchain in the upstream builder image. That is the
           # whole point of the second trigger axis.
-          SHOULD_BUILD=true
+          SHOULD_BUILD="true"
 
-          echo "caddy_version=$TARGET"      >> "$GITHUB_OUTPUT"
-          echo "revision=${INPUT_REVISION:-1}" >> "$GITHUB_OUTPUT"
-          echo "bump=$BUMP"                 >> "$GITHUB_OUTPUT"
-          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          {
+            echo "caddy_version=$TARGET"
+            echo "revision=${INPUT_REVISION:-1}"
+            echo "bump=$BUMP"
+            echo "should_build=$SHOULD_BUILD"
+          } >> "$GITHUB_OUTPUT"
 
           {
             echo "### Resolved"
@@ -172,7 +176,7 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx build --platform linux/amd64 --load \
-            --build-arg CADDY_VERSION=${{ needs.resolve.outputs.caddy_version }} \
+            --build-arg "CADDY_VERSION=${{ needs.resolve.outputs.caddy_version }}" \
             -t belune-caddy:verify . >/dev/null
           MODS=$(docker run --rm --entrypoint caddy belune-caddy:verify list-modules)
           echo "$MODS" | sed -n '1,5p'
@@ -202,7 +206,7 @@ jobs:
       - name: Check out Belune at its latest stable tag
         run: |
           set -euo pipefail
-          git clone --quiet --filter=blob:none https://github.com/${BELUNE_REPO}.git belune
+          git clone --quiet --filter=blob:none "https://github.com/${BELUNE_REPO}.git" belune
           cd belune
           TAG=$(git tag -l 'v[0-9]*' --sort=-v:refname | grep -v -- '-' | head -1)
           echo "gating against Belune $TAG"
@@ -227,7 +231,7 @@ jobs:
             -v "$PWD/belune/infra/caddy/Caddyfile.template:/etc/caddy/Caddyfile" \
             -v "$PWD/belune/infra/caddy/sites:/etc/caddy/sites" \
             ${{ needs.build.outputs.image_ref }}
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             curl -fsS http://localhost:2019/config/ >/dev/null 2>&1 && break
             sleep 2
           done
@@ -268,7 +272,7 @@ jobs:
       - name: Move :2
         run: |
           docker buildx imagetools create \
-            -t ${IMAGE}:2 ${{ needs.build.outputs.image_ref }}
+            -t "${IMAGE}:2" "${{ needs.build.outputs.image_ref }}"
           echo "moved ${IMAGE}:2 -> ${{ needs.build.outputs.image_ref }}" >> "$GITHUB_STEP_SUMMARY"
 
   hold:
