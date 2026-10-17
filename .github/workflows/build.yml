@@ -36,6 +36,9 @@ on:
     - cron: "17 6 * * *"
   push:
     branches: [main]
+    # The promote job commits .build-state.json; without this the bot would
+    # retrigger itself on its own bookkeeping.
+    paths-ignore: [".build-state.json"]
   pull_request:
 
 permissions:
@@ -54,6 +57,7 @@ jobs:
     outputs:
       caddy_version: ${{ steps.pick.outputs.caddy_version }}
       revision: ${{ steps.pick.outputs.revision }}
+      builder_digest: ${{ steps.pick.outputs.builder_digest }}
       bump: ${{ steps.pick.outputs.bump }}
       should_build: ${{ steps.pick.outputs.should_build }}
     steps:
@@ -92,6 +96,38 @@ jobs:
             ''|*[!0-9]*) echo "::error::revision must be digits"; exit 1 ;;
           esac
 
+          # The Go toolchain axis, made observable: the upstream BUILDER image
+          # is what carries the Go version, so when its digest moves we must
+          # rebuild even though the Caddy version has not changed.
+          BUILDER="caddy:${TARGET}-builder-alpine"
+          BUILDER_DIGEST=$(docker buildx imagetools inspect "$BUILDER" \
+            --format '{{.Manifest.Digest}}')
+          echo "builder digest:      $BUILDER_DIGEST"
+
+          STATE_VERSION=$(jq -r .caddy_version .build-state.json)
+          STATE_DIGEST=$(jq -r .builder_digest .build-state.json)
+          STATE_REVISION=$(jq -r .revision .build-state.json)
+
+          # ⛔ A published <version>-<revision> tag is IMMUTABLE. Rebuilding at
+          # the same Caddy version must bump the revision, never overwrite —
+          # overwriting makes rollback impossible and "which Caddy is this
+          # install running" unanswerable, which is the whole reason the
+          # revision exists.
+          REVISION="$STATE_REVISION"
+          if [ -n "${INPUT_VERSION}" ] || [ -n "${INPUT_REVISION}" ]; then
+            SHOULD_BUILD="true"                      # explicit dispatch wins
+            REVISION="${INPUT_REVISION:-$STATE_REVISION}"
+          elif [ "$TARGET" != "$STATE_VERSION" ]; then
+            SHOULD_BUILD="true"                      # new Caddy
+            REVISION=1
+          elif [ "$BUILDER_DIGEST" != "$STATE_DIGEST" ]; then
+            SHOULD_BUILD="true"                      # same Caddy, new toolchain
+            REVISION=$((STATE_REVISION + 1))
+          else
+            SHOULD_BUILD="false"                     # the daily no-op
+          fi
+          echo "should build:        $SHOULD_BUILD (revision $REVISION)"
+
           # patch vs minor decides whether promotion may be automatic.
           cur_mm="${CURRENT%.*}"; tgt_mm="${TARGET%.*}"
           if [ "$CURRENT" = "$TARGET" ]; then
@@ -102,14 +138,10 @@ jobs:
             BUMP="minor"
           fi
 
-          # A scheduled run with no version change still rebuilds, to pick up a
-          # patched Go toolchain in the upstream builder image. That is the
-          # whole point of the second trigger axis.
-          SHOULD_BUILD="true"
-
           {
             echo "caddy_version=$TARGET"
-            echo "revision=${INPUT_REVISION:-1}"
+            echo "revision=$REVISION"
+            echo "builder_digest=$BUILDER_DIGEST"
             echo "bump=$BUMP"
             echo "should_build=$SHOULD_BUILD"
           } >> "$GITHUB_OUTPUT"
@@ -136,6 +168,10 @@ jobs:
       image_ref: ${{ steps.meta.outputs.image_ref }}
     steps:
       - uses: actions/checkout@v5
+      # QEMU before buildx, matching Belune's own release workflow: the arm64
+      # half is emulated on an amd64 runner and needs the binfmt handlers.
+      # Without it that leg fails rather than merely being slow.
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
       - id: meta
@@ -196,7 +232,7 @@ jobs:
     # pull — jobs run on separate runners and the build never left its own.
     # A PR therefore gets the build and the module check; the suites run on
     # the paths that actually produce a published image.
-    if: github.event_name != 'pull_request'
+    if: needs.resolve.outputs.should_build == 'true' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       # The gate lives in the Belune repo. Pinned to the latest STABLE tag, not
@@ -257,12 +293,15 @@ jobs:
     name: Promote the floating tag
     needs: [resolve, build, test]
     if: >-
+      needs.resolve.outputs.should_build == 'true' &&
       github.event_name != 'pull_request' &&
       (needs.resolve.outputs.bump == 'patch' || needs.resolve.outputs.bump == 'none' ||
        (github.event_name == 'workflow_dispatch' && inputs.promote))
     runs-on: ubuntu-latest
     permissions:
       packages: write
+      # Also writes .build-state.json back, which is the digest check's memory.
+      contents: write
     steps:
       - uses: docker/login-action@v3
         with:
@@ -273,6 +312,29 @@ jobs:
         run: |
           docker buildx imagetools create \
             -t "${IMAGE}:2" "${{ needs.build.outputs.image_ref }}"
+          echo "moved ${IMAGE}:2 -> ${{ needs.build.outputs.image_ref }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # The digest check is only as good as its memory. Committing the state is
+      # also the audit trail: `git log .build-state.json` is the record of when
+      # the toolchain moved under us.
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Record what was promoted
+        env:
+          V: ${{ needs.resolve.outputs.caddy_version }}
+          R: ${{ needs.resolve.outputs.revision }}
+          D: ${{ needs.resolve.outputs.builder_digest }}
+        run: |
+          set -euo pipefail
+          jq -n --arg v "$V" --argjson r "$R" --arg d "$D" \
+            '{caddy_version: $v, builder_digest: $d, revision: $r}' > .build-state.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .build-state.json
+          git diff --staged --quiet && { echo "state unchanged"; exit 0; }
+          git commit -m "chore: record caddy $V-$R" -m "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+          git push
           echo "moved ${IMAGE}:2 -> ${{ needs.build.outputs.image_ref }}" >> "$GITHUB_STEP_SUMMARY"
 
   hold:
