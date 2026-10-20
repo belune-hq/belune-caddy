@@ -55,7 +55,7 @@ env:
   IMAGE: ghcr.io/belune-hq/belune-caddy
   # The repository holding the integration suites that gate promotion. Public,
   # so no token is needed to check it out.
-  BELUNE_REPO: weiliang79/belune
+  BELUNE_REPO: belune-hq/belune
 
 jobs:
   resolve:
